@@ -98,6 +98,8 @@ void restore_spindle_speed(ModbusMaster& servoBus);
 void forward_button_task(ModbusMaster& servoBus, int16_t spindleRpm);
 void reverse_button_task(ModbusMaster& servoBus, int16_t spindleRpm);
 void movement_task(ModbusMaster& servoBus, int16_t spindleRpm);
+void debounce_delay(int delayMilliseconds);
+
 SpindleDirection spindle_direction(int16_t spindleRpm);
 int16_t spindle_forward_direction_polarity();
 int16_t spindle_reverse_direction_polarity();
@@ -265,9 +267,7 @@ void forward_button_task(ModbusMaster& servoBus, int16_t spindleRpm)
             sendServoSpeed(servoBus, spindleRpm);
             printf("fwd sent rpm %d\n", spindleRpm);
         }
-        Timer timer;
-        timer.start();
-        while (timer.elapsed_time().count() < BUTTON_DEBOUNCE_MILLISECONDS*1000);
+        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
     }
     else
     {
@@ -285,21 +285,12 @@ void reverse_button_task(ModbusMaster& servoBus, int16_t spindleRpm)
             sendServoSpeed(servoBus, spindleRpm);
             printf("rev sent rpm %d\n", spindleRpm);
         }
-        Timer timer;
-        timer.start();
-        while (timer.elapsed_time().count() < BUTTON_DEBOUNCE_MILLISECONDS*1000);
+        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
     }
     else
     {
         g_reverseButtonState = ButtonState_UP;
     }
-}
-
-void wait_for_button_bounce()
-{
-    Timer timer;
-    timer.start();
-    while (timer.elapsed_time().count() < BUTTON_DEBOUNCE_MILLISECONDS*1000);
 }
 
 bool allowed_to_rotate(DigitalIn pin, bool stopped)
@@ -318,9 +309,9 @@ void movement_task(ModbusMaster& servoBus, int16_t spindleRpm)
             if (g_forwardButtonState == ButtonState_UP)
             {
                 g_forwardButtonState = ButtonState_DOWN;
-                wait_for_button_bounce();
+                debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
             }
-            printf("sent fwd=%d rev=%d send rpm %d last rpm %d new rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm, new_rpm);
+            //printf("sent fwd=%d rev=%d send rpm %d last rpm %d new rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm, new_rpm);
         }
     }
     else if (allowed_to_rotate(reverse_button, g_stopped))
@@ -332,9 +323,9 @@ void movement_task(ModbusMaster& servoBus, int16_t spindleRpm)
             if (g_reverseButtonState == ButtonState_UP)
             {
                 g_reverseButtonState = ButtonState_DOWN;
-                wait_for_button_bounce();
+                debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
             }
-            printf("sent fwd=%d rev=%d send rpm %d last rpm %d new rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm, new_rpm);
+            //printf("sent fwd=%d rev=%d send rpm %d last rpm %d new rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm, new_rpm);
         }
     }
     else if (forward_button == 1 && reverse_button == 1)
@@ -344,8 +335,8 @@ void movement_task(ModbusMaster& servoBus, int16_t spindleRpm)
         if (g_lastSentSpindleRpm != 0)
         {
             sendServoSpeed(servoBus, 0);
-            printf("fwd=%d rev=%d send rpm %d last rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm);
-            wait_for_button_bounce();
+            //printf("fwd=%d rev=%d send rpm %d last rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm);
+            debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
         }
     }
 }
@@ -429,15 +420,12 @@ void stop_button_task(ModbusMaster& servoBus)
             g_stopped = true;
             printf("stopped sent\n");
         }
-        //printf("stop down\n");
-        Timer timer;
-        timer.start();
-        while (timer.elapsed_time().count() < BUTTON_DEBOUNCE_MILLISECONDS*1000);
+        
+        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
     }
     else
     {
         g_stopButtonState = ButtonState_UP;
-        //printf("stop up\n");
     }
 }
 
@@ -445,10 +433,8 @@ void grinder_start_button_task(FlashIAP& flash, ModbusMaster& servoBus, int16_t 
 {
     if (start_button == 0)
     {
-        //printf("start button down\n");
         if (stop_button)
         {
-            //printf("start down stop down\n");
             if (g_startButtonState == ButtonState_UP)
             {
                 g_startButtonState = ButtonState_DOWN;
@@ -465,18 +451,13 @@ void grinder_start_button_task(FlashIAP& flash, ModbusMaster& servoBus, int16_t 
                     sendServoSpeed(servoBus, spindleRpm);
                 }
                 g_stopped = false;
-                //printf("start sent\n");
             }
         }
-        Timer timer;
-        timer.start();
-        while (timer.elapsed_time().count() < BUTTON_DEBOUNCE_MILLISECONDS*1000);
-        //printf("start down\n");
+        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
     }
     else
     {
         g_startButtonState = ButtonState_UP;
-        //printf("start up\n");
     }
 }
 
@@ -555,9 +536,7 @@ void rotary_switch_task(RotarySwitchState& currentState, int16_t& spindleRpm, in
 {
     do
     {
-        Timer timer;
-        timer.start();
-        while (timer.elapsed_time().count() < BUTTON_DEBOUNCE_MILLISECONDS*1000);
+        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
         
         RotarySwitchState newState = rotary_switch_state(currentState, low_first_cw, low_second_cw);
 
@@ -704,4 +683,11 @@ RotarySwitchState rotary_switch_state(const RotarySwitchState switchState, Digit
     }
 
     return ROTARY_STATE_INIT;
+}
+
+void debounce_delay(int delayMilliseconds)
+{
+    Timer timer;
+    timer.start();
+    while (timer.elapsed_time().count() < delayMilliseconds);
 }
