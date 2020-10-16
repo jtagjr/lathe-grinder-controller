@@ -5,6 +5,9 @@
 [license]:          LICENSE
 [code of conduct]:  CODE_OF_CONDUCT.md
 
+## Notes
+This is a branch from ModbusMaster port for Mbed. I made a few changes for use on Mbed OS 6.1. I also made changes to make this compatible with the servo controllers messages. The original did not correctly handle receiving data from the slave device.
+
 ## Note
 This is a port of the ModbusMaster library by 4-20ma, from Arduino to Mbed. The original description follows.
 
