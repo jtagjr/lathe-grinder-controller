@@ -86,9 +86,9 @@ void modbus_init(const uint8_t servoMotorDriverSlaveId, UnbufferedSerial& servoS
 void speed_adjust_task(ModbusMaster& modbus, int16_t spindleRpm, int16_t previousSpindleRpm);
 void flash_init(FlashIAP& flashDevice, int16_t& spindleRpm);
 void flash_write(FlashIAP& flashDevice, int16_t spindleRpm);
-void sendServoSpeed(ModbusMaster& servoBus, int16_t spindleRpm);
-int16_t readSavedSpindleSpeed(FlashIAP& flash);
-int16_t readServoSpeed(ModbusMaster& servoBus);
+void send_servo_speed(ModbusMaster& servoBus, int16_t spindleRpm);
+int16_t read_saved_spindle_speed(FlashIAP& flash);
+int16_t read_servo_speed(ModbusMaster& servoBus);
 void init_lathe_buttons();
 void init_grinder_buttons();
 void stop_button_task(ModbusMaster& servoBus);
@@ -199,7 +199,7 @@ int grinder_main()
 
 void restore_spindle_speed(ModbusMaster& servoBus)
 {
-    int16_t servoPrebootSpeed = readServoSpeed(servoBus);
+    int16_t servoPrebootSpeed = read_servo_speed(servoBus);
     printf("read servo speed %d\n", servoPrebootSpeed);
     if (g_rotarySpindleRpm == 0)
     {
@@ -224,7 +224,7 @@ void init_grinder_buttons()
 void flash_init(FlashIAP& flash, int16_t& spindleRpm)
 {
     flash.init();
-    spindleRpm = readSavedSpindleSpeed(flash);
+    spindleRpm = read_saved_spindle_speed(flash);
     if (spindleRpm > SPINDLE_MAX_RPM || spindleRpm < 0)
     {
         spindleRpm = 0;
@@ -237,7 +237,7 @@ void flash_write(FlashIAP& flash, int16_t spindleRpm)
     flash.program(&spindleRpm, FLASH_LOCATION, sizeof(spindleRpm));
 }
 
-int16_t readSavedSpindleSpeed(FlashIAP& flash)
+int16_t read_saved_spindle_speed(FlashIAP& flash)
 {
     int16_t temp = 0;
     flash.read(&temp, FLASH_LOCATION, sizeof(temp));
@@ -264,7 +264,7 @@ void forward_button_task(ModbusMaster& servoBus, int16_t spindleRpm)
         if (g_forwardButtonState == ButtonState_UP && !g_stopped)
         {
             g_forwardButtonState = ButtonState_DOWN;
-            sendServoSpeed(servoBus, spindleRpm);
+            send_servo_speed(servoBus, spindleRpm);
             printf("fwd sent rpm %d\n", spindleRpm);
         }
         debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
@@ -282,7 +282,7 @@ void reverse_button_task(ModbusMaster& servoBus, int16_t spindleRpm)
         if (g_reverseButtonState == ButtonState_UP && !g_stopped)
         {
             g_reverseButtonState = ButtonState_DOWN;
-            sendServoSpeed(servoBus, spindleRpm);
+            send_servo_speed(servoBus, spindleRpm);
             printf("rev sent rpm %d\n", spindleRpm);
         }
         debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
@@ -305,7 +305,7 @@ void movement_task(ModbusMaster& servoBus, int16_t spindleRpm)
         auto new_rpm = spindleRpm * spindle_forward_direction_polarity();
         if (new_rpm != g_lastSentSpindleRpm)
         {
-            sendServoSpeed(servoBus, new_rpm);
+            send_servo_speed(servoBus, new_rpm);
             if (g_forwardButtonState == ButtonState_UP)
             {
                 g_forwardButtonState = ButtonState_DOWN;
@@ -319,7 +319,7 @@ void movement_task(ModbusMaster& servoBus, int16_t spindleRpm)
         auto new_rpm = spindleRpm * spindle_reverse_direction_polarity();
         if (new_rpm != g_lastSentSpindleRpm)
         {
-            sendServoSpeed(servoBus, new_rpm);
+            send_servo_speed(servoBus, new_rpm);
             if (g_reverseButtonState == ButtonState_UP)
             {
                 g_reverseButtonState = ButtonState_DOWN;
@@ -334,7 +334,7 @@ void movement_task(ModbusMaster& servoBus, int16_t spindleRpm)
         g_reverseButtonState = ButtonState_UP;
         if (g_lastSentSpindleRpm != 0)
         {
-            sendServoSpeed(servoBus, 0);
+            send_servo_speed(servoBus, 0);
             //printf("fwd=%d rev=%d send rpm %d last rpm %d\n", forward_button.read(), reverse_button.read(), spindleRpm, g_lastSentSpindleRpm);
             debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
         }
@@ -391,18 +391,18 @@ void speed_adjust_task(ModbusMaster& servoBus, int16_t spindleRpm, int16_t previ
         if (spindleRpm > 0 && grinder_direction_polarity() < 0)
         {
             auto rpm = -1 * spindleRpm;
-            sendServoSpeed(servoBus, rpm);
+            send_servo_speed(servoBus, rpm);
             printf("Sent servo rpm %d\n", rpm);
         }
         else if (spindleRpm < 0 && grinder_direction_polarity() > 0)
         {
             auto rpm = -1 * spindleRpm;
-            sendServoSpeed(servoBus, rpm);
+            send_servo_speed(servoBus, rpm);
             printf("Sent servo rpm %d\n", rpm);
         }
         else
         {
-            sendServoSpeed(servoBus, spindleRpm);
+            send_servo_speed(servoBus, spindleRpm);
             printf("Sent servo rpm %d\n", spindleRpm);
         }
     }
@@ -440,15 +440,15 @@ void grinder_start_button_task(FlashIAP& flash, ModbusMaster& servoBus, int16_t 
                 g_startButtonState = ButtonState_DOWN;
                 if (spindleRpm > 0 && grinder_direction_polarity() < 0)
                 {
-                    sendServoSpeed(servoBus, -1 * spindleRpm);
+                    send_servo_speed(servoBus, -1 * spindleRpm);
                 }
                 else if (spindleRpm < 0 && grinder_direction_polarity() > 0)
                 {
-                    sendServoSpeed(servoBus, -1 * spindleRpm);
+                    send_servo_speed(servoBus, -1 * spindleRpm);
                 }
                 else
                 {
-                    sendServoSpeed(servoBus, spindleRpm);
+                    send_servo_speed(servoBus, spindleRpm);
                 }
                 g_stopped = false;
             }
@@ -474,7 +474,7 @@ void lathe_start_button_task(FlashIAP& flash, ModbusMaster& servoBus, int16_t sp
 }
 
 
-void sendServoSpeed(ModbusMaster& servoBus, int16_t spindleRpm)
+void send_servo_speed(ModbusMaster& servoBus, int16_t spindleRpm)
 {
     auto status = servoBus.writeSingleRegister(MOTOR_SPINDLE_SPEED_REGISTER, spindleRpm);
     if (status != 0)
@@ -496,7 +496,7 @@ void sendServoSpeed(ModbusMaster& servoBus, int16_t spindleRpm)
     }
 }
 
-int16_t readServoSpeed(ModbusMaster& servoBus)
+int16_t read_servo_speed(ModbusMaster& servoBus)
 {
     int16_t speed = 0;
     auto status = servoBus.readHoldingRegisters(MOTOR_SPINDLE_SPEED_REGISTER, 1);
