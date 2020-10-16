@@ -1,0 +1,11 @@
+Notes on Grinder PCB Layout
+
+Yellow wire of PS/2 connector is RX of motor controller unit
+Red wire of PS/2 connector is TX of motor controller unit
+Ps/2 3pin connector - with the tabs facing you, Gnd it the right pin, Rx of Unit is middel, Tx of Unit is Left
+
+board changes
+move stop button wire
+
+swap pins on PCB to LV for RS232
+swap pins at connector to PS/2
