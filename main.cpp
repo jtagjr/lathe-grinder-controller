@@ -5,9 +5,16 @@
 
 #include "mbed.h"
 #include "TM1637.h"
+#include "rotary_encoder.h"
 #include "Font_7Seg.h"
 #include "Timer.h"
 #include "ModbusMaster.h"
+#include <analogin_api.h>
+#include <cstdint>
+#include <limits>
+#include <cmath>
+#include <Ticker.h>
+#include <gpio_api.h>
 
 #define FLASH_LOCATION MBED_ROM_START+MBED_ROM_SIZE-0x10000 
 #define SECTOR_SIZE 2048
@@ -17,23 +24,6 @@
 #define MODBUS_BAUD_RATE 115200
 #define SERVO_MOTOR_DRIVER_ID 1
 #define MOTOR_SPINDLE_SPEED_REGISTER 169
-
-enum RotarySwitchState
-{
-    ROTARY_STATE_INIT = 0,
-    ROTARY_STATE_WAITING_CW,
-    ROTARY_STATE_CW,
-    ROTARY_STATE_CW_ENDING,
-    ROTARY_STATE_WAITING_CCW,
-    ROTARY_STATE_CCW,
-    ROTARY_STATE_CCW_ENDING
-};
-
-enum ButtonState
-{
-    ButtonState_DOWN = 0,
-    ButtonState_UP
-};
 
 enum SpindleDirection
 {
@@ -45,16 +35,16 @@ enum SpindleDirection
 DigitalOut led1(LED1);
 
 // Right rotary switch
-DigitalIn rotary_button_right(PC_0); //SW
+//DigitalIn rotary_button_right(PC_0); //SW
 DigitalIn rotary_line_right_low_1st_cw(PC_2); //CLK
 DigitalIn rotary_line_right_low_2nd_cw(PC_1); //DT
 
 // Left rotary switch
-DigitalIn rotary_button_left(PC_9); //SW
+//DigitalIn rotary_button_left(PC_9); //SW
 DigitalIn rotary_line_left_low_1st_cw(PB_8); //CLK
 DigitalIn rotary_line_left_low_2nd_cw(PB_9); //DT
 
-DigitalIn user_button(USER_BUTTON);
+//DigitalIn user_button(USER_BUTTON);
 DigitalIn stop_button(PC_4); // From E switch
 DigitalIn start_button(PF_1); // From LED momentary switch
 DigitalIn forward_button(PC_8); // From lathe down on bar, doesn't exist on grinder
@@ -73,9 +63,6 @@ DigitalIn reverse_button(PC_6); // From lathe up on bar, doesn't exist on grinde
 // PB_13 to 3.3v to 5v to DIO on LED display
 
 typedef void (*ButtonDownCallback)();
-void rotary_right_button_down();
-void rotary_left_button_down();
-void rotary_button_task(FlashIAP& flash, ModbusMaster& servoBus, DigitalIn pin, ButtonState& state, ButtonDownCallback button_down);
 void rotary_switch_init(RotarySwitchState& currentState);
 RotarySwitchState rotary_switch_state(const RotarySwitchState switchState, DigitalIn low_first_cw, DigitalIn low_second_cw);
 void rotary_switch_task(RotarySwitchState& currentState, int16_t& spindleRpm, int16_t increment_amount, DigitalIn low_first_cw, DigitalIn low_second_cw);
@@ -104,10 +91,11 @@ SpindleDirection spindle_direction(int16_t spindleRpm);
 int16_t spindle_forward_direction_polarity();
 int16_t spindle_reverse_direction_polarity();
 int16_t grinder_direction_polarity();
+void grinder_head_speed_encoder_switch_task();
 
-ButtonState g_rotaryButtonRightState = ButtonState_UP;
-ButtonState g_rotaryButtonLeftState = ButtonState_UP;
-ButtonState g_userButtonState = ButtonState_UP;
+static RotarySwitchState left_rotary_switch_state = ROTARY_STATE_INIT;
+static RotarySwitchState right_rotary_switch_state = ROTARY_STATE_INIT;
+
 ButtonState g_startButtonState = ButtonState_UP;
 ButtonState g_stopButtonState = ButtonState_UP;
 ButtonState g_forwardButtonState = ButtonState_UP;
@@ -119,6 +107,86 @@ bool g_stopped = true;
 
 int lathe_main();
 int grinder_main();
+
+#define WAIT_TIME_MS 50 
+// max 5 revolutions per second to go from bottom to top in about 60 seconds
+#define MAX_PULSES_PER_SECOND 3000*4
+#define PULSES_PER_REVOLUTION 2000
+#define INCREMENT_RATE_IN_MICROSECONDS 1000
+#define PULSES_PER_HALF_TEN_THOUSANDTH 2
+#define PULSES_PER_ONE_THOUSANDTH 40
+#define VOLTAGE_DIFF 1000
+
+
+uint32_t steps_per_second_speed_curve(uint32_t desired_speed, int time_increment);
+void increase_pwm();
+void decrease_pwm();
+
+static volatile uint32_t s_desired_steps_per_second = 0;
+static volatile uint32_t s_current_steps_per_second = 0;
+static volatile uint32_t s_starting_speed = 0;
+static unsigned int s_last_speed_percent = 0;
+static volatile int s_speed_increment = -20;
+static volatile bool s_speed_ticker_running = false;
+static int32_t s_last_voltage = 0;
+static Ticker s_speed_ticker;  
+static const unsigned int one_percent = 418;
+
+// Bottom rotary switch
+static DigitalIn s_rotary_line_bottom_low_1st_cw(PA_0); //CLK
+static DigitalIn s_rotary_line_bottom_low_2nd_cw(PA_1); //DT
+
+// Top rotary switch
+static DigitalIn s_rotary_line_top_low_1st_cw(PA_10); //CLK
+static DigitalIn s_rotary_line_top_low_2nd_cw(PC_0); //DT
+
+static ButtonState s_up_button_state = ButtonState_UP;
+static DigitalIn s_up_button(PA_5); 
+static ButtonState s_down_button_state = ButtonState_UP;
+static DigitalIn s_down_button(PA_6); 
+
+static DigitalOut s_head_enable_pin(PA_4);
+static DigitalOut s_head_direction_pin(PA_9);
+static DigitalOut s_head_motor_rpm_pin(PWM_OUT);
+static PwmOut s_pwm(PWM_OUT); // PB_4
+
+static RotarySwitchState s_top_rotary_encoder_state = ROTARY_STATE_INIT;
+static RotarySwitchState s_bottom_rotary_encoder_state = ROTARY_STATE_INIT;
+
+void move_grinder_head_task(analogin_t& speed_control);
+void move_motor_head(analogin_t& speed_control);
+void pulse_motor(bool direction_up, unsigned int number_of_pulses, DigitalOut&& pin);
+void set_pwm_high();
+void init_pwm();
+void stop_motor_head();
+void set_motor_head_up();
+void set_motor_head_down();
+void enable_motor_head();
+void disable_motor_head();
+void motor_head_button_up();
+void grinder_head_up_down_rotary_switches_task();
+
+#define NUM_SAMPLES 40
+static int32_t s_voltages[NUM_SAMPLES];
+static int32_t s_write_index = 0;
+static int32_t s_voltage_average = 0;
+static bool s_pwm_suspended = true;
+
+void add_voltage(uint32_t sample)
+{
+    if (s_write_index >= NUM_SAMPLES)
+    {
+        s_write_index = 0;
+    }
+    s_voltages[s_write_index++] = sample;
+
+    int32_t average = 0;
+    for(int32_t i=0; i<NUM_SAMPLES; ++i)
+    {
+        average += s_voltages[i];
+    }
+    s_voltage_average = average/NUM_SAMPLES;
+}
 
 int main()
 {
@@ -148,15 +216,51 @@ int lathe_main()
     TM1637 ledDisplay(PB_13 /* DIO*/, PB_14 /* CLK */); // Bit banging
     spindle_display_init(ledDisplay, g_rotarySpindleRpm);
 
-    while (1)
+    while (true)
     {
         stop_button_task(servoBus);
         lathe_start_button_task(flash, servoBus, g_rotarySpindleRpm);
-        rotary_switch_task(currentState, g_rotarySpindleRpm, 5, rotary_line_right_low_1st_cw, rotary_line_right_low_2nd_cw);
-        rotary_switch_task(currentState, g_rotarySpindleRpm, 100, rotary_line_left_low_1st_cw, rotary_line_left_low_2nd_cw);
+        rotary_switch_task(currentState, rotary_line_right_low_1st_cw, rotary_line_right_low_2nd_cw, 
+                           []()
+                           {
+                                g_rotarySpindleRpm += 5;
+                                if (g_rotarySpindleRpm > SPINDLE_MAX_RPM)
+                                {
+                                    g_rotarySpindleRpm = SPINDLE_MAX_RPM;
+                                }
+                           },
+                           []()
+                           {
+                                if (g_rotarySpindleRpm < 5)
+                                {
+                                    g_rotarySpindleRpm = 0;
+                                }
+                                else
+                                {
+                                    g_rotarySpindleRpm -= 5;
+                                }
+                           });
+        rotary_switch_task(currentState, rotary_line_left_low_1st_cw, rotary_line_left_low_2nd_cw,
+                           []()
+                           {
+                                g_rotarySpindleRpm += 100;
+                                if (g_rotarySpindleRpm > SPINDLE_MAX_RPM)
+                                {
+                                    g_rotarySpindleRpm = SPINDLE_MAX_RPM;
+                                }
+                           },
+                           []()
+                           {
+                                if (g_rotarySpindleRpm < 100)
+                                {
+                                    g_rotarySpindleRpm = 0;
+                                }
+                                else
+                                {
+                                    g_rotarySpindleRpm -= 100;
+                                }
+                           });
         spindle_display_task(ledDisplay, g_rotarySpindleRpm, g_lastSentSpindleRpm);
-        rotary_button_task(flash, servoBus, rotary_button_right, g_rotaryButtonRightState, &rotary_right_button_down);
-        rotary_button_task(flash, servoBus, rotary_button_left, g_rotaryButtonLeftState, &rotary_left_button_down);
         movement_task(servoBus, g_rotarySpindleRpm);
     }
 }
@@ -169,9 +273,6 @@ int grinder_main()
     flash_init(flash, g_rotarySpindleRpm);
     printf("Stored spindle speed: %u\n", g_rotarySpindleRpm);
 
-    RotarySwitchState currentState;
-    rotary_switch_init(currentState);
-
     UnbufferedSerial servoSerial(PB_10, PB_11, MODBUS_BAUD_RATE);
     servoSerial.format(8, SerialBase::None, 2); 
     ModbusMaster servoBus;
@@ -180,21 +281,75 @@ int grinder_main()
     init_grinder_buttons();
     restore_spindle_speed(servoBus);
 
-    TM1637 ledDisplay(PB_13 /* DIO*/, PB_14 /* CLK */); // Bit banging
+    TM1637 ledDisplay(PB_13 , PB_14); // DIO // CLK // Bit banging
     spindle_display_init(ledDisplay, g_rotarySpindleRpm);
+    
+    analogin_t speed_control;
+    analogin_init(&speed_control, PA_7);
 
-    while (1)
+    disable_motor_head();
+    debounce_delay(100);
+    init_pwm();
+    enable_motor_head();
+    debounce_delay(100);
+
+    while (true)
     {
+        move_grinder_head_task(speed_control);
+        grinder_head_up_down_rotary_switches_task();
+        
         stop_button_task(servoBus);
         grinder_start_button_task(flash, servoBus, g_rotarySpindleRpm);
-        rotary_switch_task(currentState, g_rotarySpindleRpm, 5, rotary_line_right_low_1st_cw, rotary_line_right_low_2nd_cw);
-        rotary_switch_task(currentState, g_rotarySpindleRpm, 100, rotary_line_left_low_1st_cw, rotary_line_left_low_2nd_cw);
+        grinder_head_speed_encoder_switch_task();
         spindle_display_task(ledDisplay, g_rotarySpindleRpm, g_lastSentSpindleRpm);
-        rotary_button_task(flash, servoBus, rotary_button_right, g_rotaryButtonRightState, &rotary_right_button_down);
-        rotary_button_task(flash, servoBus, rotary_button_left, g_rotaryButtonLeftState, &rotary_left_button_down);
         speed_adjust_task(servoBus, g_rotarySpindleRpm, g_lastSentSpindleRpm);
         g_lastSentSpindleRpm = g_rotarySpindleRpm;
     }
+}
+
+void grinder_head_speed_encoder_switch_task()
+{
+    rotary_switch_task(right_rotary_switch_state, rotary_line_right_low_1st_cw, rotary_line_right_low_2nd_cw, 
+                        []()
+                        {
+                            g_rotarySpindleRpm += 5;
+                            if (g_rotarySpindleRpm > SPINDLE_MAX_RPM)
+                            {
+                                g_rotarySpindleRpm = SPINDLE_MAX_RPM;
+                            }
+                        },
+                        []()
+                        {
+                            if (g_rotarySpindleRpm < 5)
+                            {
+                                g_rotarySpindleRpm = 0;
+                            }
+                            else
+                            {
+                                g_rotarySpindleRpm -= 5;
+                            }
+                        });
+                        
+    rotary_switch_task(left_rotary_switch_state, rotary_line_left_low_1st_cw, rotary_line_left_low_2nd_cw,
+                        []()
+                        {
+                            g_rotarySpindleRpm += 100;
+                            if (g_rotarySpindleRpm > SPINDLE_MAX_RPM)
+                            {
+                                g_rotarySpindleRpm = SPINDLE_MAX_RPM;
+                            }
+                        },
+                        []()
+                        {
+                            if (g_rotarySpindleRpm < 100)
+                            {
+                                g_rotarySpindleRpm = 0;
+                            }
+                            else
+                            {
+                                g_rotarySpindleRpm -= 100;
+                            }
+                        });
 }
 
 void restore_spindle_speed(ModbusMaster& servoBus)
@@ -356,29 +511,6 @@ int16_t grinder_direction_polarity()
     return -1;
 }
 
-void rotary_button_task(FlashIAP& flash, ModbusMaster& servoBus, DigitalIn pin, ButtonState& state, ButtonDownCallback callback)
-{
-    if (pin == 0)
-    {
-        if (state == ButtonState_UP)
-        {
-            state = ButtonState_DOWN;
-            if (callback)
-            {
-                callback();
-            }
-        }
-    }
-    else
-    {
-        state = ButtonState_UP;
-    }
-}
-
-void rotary_right_button_down(){}
-
-void rotary_left_button_down(){}
-
 void modbus_init(const uint8_t servoMotorDriverSlaveId, UnbufferedSerial& servoSerial, ModbusMaster& servoBus)
 {
     servoBus.begin(servoMotorDriverSlaveId, servoSerial);
@@ -527,167 +659,319 @@ void spindle_display_task(TM1637& display, int16_t spindleRpm, int16_t previousS
     } 
 }
 
-void rotary_switch_init(RotarySwitchState& currentState)
+
+void grinder_head_up_down_rotary_switches_task()
 {
-    currentState = ROTARY_STATE_INIT;
+    if (1 == s_down_button && 1 == s_up_button)
+    {
+        //printf("rotary_buttons both up\n");
+        rotary_switch_task(s_bottom_rotary_encoder_state, 
+                           s_rotary_line_bottom_low_1st_cw, 
+                           s_rotary_line_bottom_low_2nd_cw, 
+                           []()
+                           { 
+                               printf("rotary_switch_task cw event right\n");
+                               pulse_motor(false, PULSES_PER_HALF_TEN_THOUSANDTH, DigitalOut(PWM_OUT)); 
+                            }, 
+                           []()
+                           { 
+                               printf("rotary_switch_task cw event left\n");
+                               pulse_motor(true, PULSES_PER_HALF_TEN_THOUSANDTH, DigitalOut(PWM_OUT)); 
+                            });
+
+        rotary_switch_task(s_top_rotary_encoder_state, 
+                           s_rotary_line_top_low_1st_cw, 
+                           s_rotary_line_top_low_2nd_cw, 
+                           []()
+                           { 
+                               printf("rotary_switch_task ccw event right\n");
+                               pulse_motor(false, PULSES_PER_ONE_THOUSANDTH, DigitalOut(PWM_OUT)); 
+                            }, 
+                           []()
+                           { 
+                               printf("rotary_switch_task ccw event left\n");
+                               pulse_motor(true, PULSES_PER_ONE_THOUSANDTH, DigitalOut(PWM_OUT)); 
+                            });
+    }
 }
 
-void rotary_switch_task(RotarySwitchState& currentState, int16_t& spindleRpm, int16_t increment_amount, DigitalIn low_first_cw, DigitalIn low_second_cw)
+void init_pwm()
 {
-    do
-    {
-        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
-        
-        RotarySwitchState newState = rotary_switch_state(currentState, low_first_cw, low_second_cw);
-
-        if (currentState == ROTARY_STATE_CW_ENDING && newState == ROTARY_STATE_INIT)
-        {
-            spindleRpm += increment_amount;
-            if (spindleRpm > SPINDLE_MAX_RPM)
-            {
-                spindleRpm = SPINDLE_MAX_RPM;
-            }
-        }
-        else if (currentState == ROTARY_STATE_CCW_ENDING && newState == ROTARY_STATE_INIT)
-        {
-            if (spindleRpm < increment_amount)
-            {
-                spindleRpm = 0;
-            }
-            else
-            {
-                spindleRpm -= increment_amount;
-            }
-        }
-
-        currentState = newState;
-    } while(currentState != ROTARY_STATE_INIT);
-    //printf("rotary rpm %d\n", spindleRpm);
+    s_pwm.suspend();
+    set_pwm_high();
 }
 
-RotarySwitchState rotary_switch_state(const RotarySwitchState switchState, DigitalIn rotary_line_low_1st_cw, DigitalIn rotary_line_low_2nd_cw)
+void set_pwm_high()
 {
-    switch (switchState)
+    gpio_t pin;
+    gpio_init_out(&pin, PWM_OUT);
+    gpio_write(&pin, 1);
+}
+
+void pulse_motor(bool direction_up, unsigned int number_of_pulses, DigitalOut&& pin)
+{
+    enable_motor_head();
+
+    printf("pulse motor\n");
+    // Set direction to move 
+    if (direction_up)
     {
-        case ROTARY_STATE_INIT:
-            if (rotary_line_low_1st_cw.read() == 0)
-            {
-                if (rotary_line_low_2nd_cw.read() == 1)
-                {
-                    return ROTARY_STATE_WAITING_CW;
-                }
-            }
-            else if (rotary_line_low_2nd_cw.read() == 0)
-            {
-                if (rotary_line_low_1st_cw.read() == 1)
-                {
-                    return ROTARY_STATE_WAITING_CCW;
-                }
-            }
-            break;
-
-        case ROTARY_STATE_WAITING_CW:
-            if (rotary_line_low_1st_cw.read() == 0)
-            {
-                if (rotary_line_low_2nd_cw.read() == 0)
-                {
-                    return ROTARY_STATE_CW;
-                }
-                else 
-                {
-                    return ROTARY_STATE_WAITING_CW;
-                }
-            }
-            break;
-
-        case ROTARY_STATE_CW:
-            if (rotary_line_low_1st_cw.read() == 1)
-            {
-                if (rotary_line_low_2nd_cw.read() == 0)
-                {
-                    return ROTARY_STATE_CW_ENDING;
-                }
-                else 
-                {
-                    return ROTARY_STATE_CW;
-                }
-            }
-            else if (rotary_line_low_1st_cw.read() == 0 && rotary_line_low_2nd_cw.read() == 0)
-            {
-                return ROTARY_STATE_CW;
-            }
-            break;
-
-        case ROTARY_STATE_CW_ENDING:
-            if (rotary_line_low_1st_cw.read() == 1)
-            {
-                if (rotary_line_low_2nd_cw.read() == 1)
-                {
-                    return ROTARY_STATE_INIT;
-                }
-                else 
-                {
-                    return ROTARY_STATE_CW_ENDING;
-                }
-            }
-            break;
-
-        case ROTARY_STATE_WAITING_CCW:
-            if (rotary_line_low_2nd_cw.read() == 0)
-            {
-                if (rotary_line_low_1st_cw.read() == 0)
-                {
-                    return ROTARY_STATE_CCW;
-                }
-                else 
-                {
-                    return ROTARY_STATE_WAITING_CCW;
-                }
-            }
-            break;
-
-        case ROTARY_STATE_CCW:
-            if (rotary_line_low_2nd_cw.read() == 1)
-            {
-                if (rotary_line_low_1st_cw.read() == 0)
-                {
-                    return ROTARY_STATE_CCW_ENDING;
-                }
-                else 
-                {
-                    return ROTARY_STATE_CCW;
-                }
-            }
-            else if (rotary_line_low_1st_cw.read() == 0 && rotary_line_low_2nd_cw.read() == 0)
-            {
-                return ROTARY_STATE_CCW;
-            }
-            break;
-
-        case ROTARY_STATE_CCW_ENDING:
-            if (rotary_line_low_2nd_cw.read() == 1)
-            {
-                if (rotary_line_low_1st_cw.read() == 1)
-                {
-                    return ROTARY_STATE_INIT;
-                }
-                else 
-                {
-                    return ROTARY_STATE_CCW_ENDING;
-                }
-            }
-            break;
-
-        default:
-            break;
+        set_motor_head_up();
+    }
+    else 
+    {
+        set_motor_head_down();
     }
 
-    return ROTARY_STATE_INIT;
+    for(uint32_t i=0; i<number_of_pulses; ++i)
+    {
+        pin.write(0);
+        wait_us(500000/PULSES_PER_REVOLUTION);
+        pin.write(1);
+        wait_us(500000/PULSES_PER_REVOLUTION);
+    }
+    disable_motor_head();
 }
 
-void debounce_delay(int delayMilliseconds)
+void move_grinder_head_task(analogin_t& speed_control)
 {
-    Timer timer;
-    timer.start();
-    while (timer.elapsed_time().count() < delayMilliseconds);
+    add_voltage(analogin_read_u16(&speed_control));
+    // first check up and down buttons
+    // If one is down set the direction pin, enable servo control and run below algorithm
+    if (0 == s_up_button)
+    {
+        //printf("move_grinder_head_task s_up_button down\n");
+        if (!s_speed_ticker_running)
+        {
+            // Set direction pin to up
+            set_motor_head_up();
+            move_motor_head(speed_control);
+            s_up_button_state = ButtonState_DOWN;
+            debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
+        }
+    }
+    else if (0 == s_down_button)
+    {
+        //printf("move_grinder_head_task s_down_button down\n");
+        if (!s_speed_ticker_running)
+        {            
+            // Set direction pin to down
+            set_motor_head_down();
+            move_motor_head(speed_control);
+            s_down_button_state = ButtonState_DOWN;
+            debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
+        }
+    }
+    else if (ButtonState_DOWN == s_up_button_state ||  ButtonState_DOWN == s_down_button_state)
+    {
+        printf("move_grinder_head_task stop motor\n");
+        if (s_speed_ticker_running)
+        {
+            s_speed_ticker.detach();
+        }
+        motor_head_button_up();
+        s_up_button_state = ButtonState_UP;
+        s_down_button_state = ButtonState_UP;
+        debounce_delay(BUTTON_DEBOUNCE_MILLISECONDS*1000);
+    }
+}
+
+void set_motor_head_up()
+{
+    s_head_direction_pin = 0;
+}
+
+void set_motor_head_down()
+{
+    s_head_direction_pin = 1;
+}
+
+void enable_motor_head()
+{
+    s_head_enable_pin = 0;
+}
+
+void disable_motor_head()
+{
+    s_head_enable_pin = 1;
+}
+
+void move_motor_head(analogin_t& speed_control)
+{    
+    auto diff = abs(s_voltage_average - s_last_voltage);
+
+    if (diff > VOLTAGE_DIFF || (s_voltage_average < one_percent && 0 != s_desired_steps_per_second))
+    {
+        auto speed_percent = s_voltage_average / one_percent;
+        if (speed_percent > 100)
+        {
+            speed_percent = 100;
+        }
+        s_last_voltage = s_voltage_average;
+
+        s_desired_steps_per_second = (MAX_PULSES_PER_SECOND * speed_percent)/100;
+        unsigned int timer_delay = 0;
+        Callback<void()> timer_event = nullptr;
+        if (s_desired_steps_per_second < s_current_steps_per_second)
+        {
+            timer_event = decrease_pwm;
+            s_speed_increment = 20;
+            timer_delay = 10000;//(s_current_steps_per_second - s_desired_steps_per_second) * INCREMENT_RATE_IN_MICROSECONDS / MAX_PULSES_PER_SECOND;
+        }
+        else 
+        {
+            timer_event = increase_pwm;
+            s_speed_increment = -20;
+            timer_delay = 10000;//(s_desired_steps_per_second - s_current_steps_per_second) * INCREMENT_RATE_IN_MICROSECONDS / MAX_PULSES_PER_SECOND;
+        } 
+
+        printf("voltage value=%u last-speed-percent=%u speed-percent=%u time-delay=%u current-steps-sec=%u desired-steps-sec/sec=%u\n", 
+            s_voltage_average, 
+            s_last_speed_percent, 
+            speed_percent, 
+            timer_delay,
+            s_current_steps_per_second,
+            s_desired_steps_per_second); 
+        
+        s_speed_ticker_running = true;
+        s_last_speed_percent = speed_percent;
+        s_speed_ticker.attach(timer_event, std::chrono::microseconds(timer_delay));
+    }    
+}
+
+void motor_head_button_up()
+{
+    if (s_speed_ticker_running)
+    {
+        s_speed_ticker.detach();
+    }
+    s_desired_steps_per_second = 0;
+    s_speed_increment = 20;
+    auto timer_delay = 10000;//s_current_steps_per_second * INCREMENT_RATE_IN_MICROSECONDS / MAX_PULSES_PER_SECOND;
+    s_last_speed_percent = 0;
+    s_speed_ticker_running = true;
+    s_speed_ticker.attach(decrease_pwm, std::chrono::microseconds(timer_delay));
+}
+
+void stop_motor_head()
+{
+    printf("stop_motor_head\n");
+    core_util_critical_section_enter();
+    if (s_speed_ticker_running)
+    {
+        s_speed_ticker.detach();
+    }
+    core_util_critical_section_exit();
+    s_speed_ticker_running = false;
+    s_last_speed_percent = 0;
+    s_last_voltage = 0;
+    s_starting_speed = 0;
+    s_current_steps_per_second = 0;
+    s_desired_steps_per_second = 0;
+    s_pwm_suspended = true;
+    s_pwm.suspend();
+    set_pwm_high();
+    //disable_motor_head();
+}
+
+uint32_t steps_per_second_speed_curve(uint32_t desired_speed, int time_increment, uint32_t starting_speed)
+{
+    if (desired_speed > starting_speed)
+    {
+        return ((desired_speed - starting_speed) / (1.0f + exp(-0.2*time_increment))) + starting_speed;
+    }
+    else 
+    {
+        return ((starting_speed - desired_speed) / (1.0f + exp(-0.2*time_increment)));
+    }
+}
+
+void increase_pwm()
+{
+    if (s_desired_steps_per_second != s_starting_speed)
+    {
+        s_current_steps_per_second = steps_per_second_speed_curve(s_desired_steps_per_second, s_speed_increment++, s_starting_speed);
+        printf("increase_pwm desired=%u  current=%u\n", s_desired_steps_per_second, s_current_steps_per_second);
+
+        if (s_desired_steps_per_second == 0)
+        {
+            stop_motor_head();
+            return;
+        }
+
+        s_pwm.period_us(1000000.0/s_current_steps_per_second);
+        if (s_pwm_suspended)
+        {
+            enable_motor_head();
+            s_pwm.resume();
+            s_pwm.write(0.50);
+            s_pwm.period_us(1000000.0/s_current_steps_per_second);
+            s_pwm_suspended = false;
+        }
+
+        if (s_speed_increment > 20)
+        {
+            s_pwm.period_us(1000000.0/s_desired_steps_per_second);
+            s_speed_ticker.detach();
+            s_speed_ticker_running = false;
+            s_starting_speed = s_current_steps_per_second = s_desired_steps_per_second;
+        }
+        else 
+        {
+            s_pwm.period_us(1000000.0/s_current_steps_per_second);
+        }
+    }
+    else 
+    {
+        s_speed_ticker.detach();
+        s_speed_ticker_running = false;
+    }
+}
+
+void decrease_pwm()
+{
+    s_current_steps_per_second = s_desired_steps_per_second + steps_per_second_speed_curve(s_desired_steps_per_second, s_speed_increment--, s_starting_speed);
+    printf("decrease_pwm desired=%u  current=%u starting speed=%u\n", s_desired_steps_per_second, s_current_steps_per_second, s_starting_speed);
+        
+    if (s_speed_increment < -20)
+    {
+        if (s_desired_steps_per_second > 0)
+        {
+            s_pwm.period_us(1000000.0/s_desired_steps_per_second);
+            if (s_pwm_suspended)
+            {
+                enable_motor_head();
+                s_pwm_suspended = false;
+                s_pwm.resume();
+                s_pwm.write(0.50);
+                s_pwm.period_us(1000000.0/s_desired_steps_per_second);
+            }
+            s_speed_ticker.detach();
+            s_speed_ticker_running = false;
+            s_starting_speed = s_current_steps_per_second = s_desired_steps_per_second;
+        }
+        else 
+        {
+            stop_motor_head();
+        }
+    }
+    else 
+    {
+        if (s_current_steps_per_second > 0)
+        {
+            s_pwm.period_us(1000000.0/s_current_steps_per_second);
+            if (s_pwm_suspended)
+            {
+                enable_motor_head();
+                s_pwm_suspended = false;
+                s_pwm.resume();
+                s_pwm.write(0.50);
+                s_pwm.period_us(1000000.0/s_current_steps_per_second);
+            }
+        }
+        else 
+        {
+            stop_motor_head();
+        }
+    }
 }
